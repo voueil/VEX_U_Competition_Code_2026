@@ -2,104 +2,216 @@
 
 using namespace vex;
 
+// Brain & Controller
 brain Brain;
+controller Controller1(primary);
+competition Competition;
 
-// -------------------- Motors --------------------
-// Left side
-motor L1(PORT7, ratio18_1, false);
-motor L2(PORT8, ratio18_1, false);
+// =====================
+// Sensors
+// =====================
+inertial InertialSensor(PORT5);
+optical opti(PORT6);
+digital_out DigitalOutA(Brain.ThreeWirePort.A);
 
-// Right side
-motor R1(PORT10, ratio18_1, true);
-motor R2(PORT11, ratio18_1, true);
+// =====================
+// Drive Motors
+// =====================
+motor l1(PORT2, ratio18_1, false);
+motor l2(PORT4, ratio18_1, true);
+motor_group LeftDrive(l1, l2);
 
-// -------------------- Functions --------------------
-void setDrive(double power) {
-  L1.spin(fwd, power, pct);
-  L2.spin(fwd, power, pct);
+motor r1(PORT1, ratio18_1, true);
+motor r2(PORT3, ratio18_1, false);
+motor_group RightDrive(r1, r2);
 
-  R1.spin(fwd, power, pct);
-  R2.spin(fwd, power, pct);
+// =====================
+// Intake Motors
+// =====================
+motor Motor11(PORT7, ratio18_1, false);
+motor Motor12(PORT8, ratio18_1, false);
+motor Motor13(PORT9, ratio18_1, false);
+motor Motor14(PORT10, ratio18_1, false);
+motor Motor15(PORT11, ratio18_1, false);
+
+// =====================
+// PID Constants
+// =====================
+double kP_drive = 0.02, kI_drive = 0, kD_drive = 0;
+double kP_turn = 0.13, kI_turn = 0, kD_turn = 0;
+
+double gearRatio = 1.0;
+double wheelDiameter = 3.75;
+
+// =====================
+// Helper
+// =====================
+double inchesToDegrees(double inches) {
+  double wheelCircumference = wheelDiameter * 3.14159265;
+  return (inches / wheelCircumference) * 360.0 / gearRatio;
 }
 
-void resetEncoders() {
-  L1.resetPosition();
-  L2.resetPosition();
+// =====================
+// Drive PID
+// =====================
+void drivePID(double targetInches, int timeout = 3000) {
 
-  R1.resetPosition();
-  R2.resetPosition();
-}
+  double targetDegrees = inchesToDegrees(targetInches);
+  double error, lastError = 0, derivative, integral = 0;
+  double startTime = Brain.timer(msec);
 
-double getAverageEncoder() {
-  return (L1.position(deg) + L2.position(deg) +
-          R1.position(deg) + R2.position(deg)) / 4.0;
-}
-
-// -------------------- PID Drive --------------------
-void drivePID(double targetDeg) {
-  // ===== PID constants =====
-  double kP = 0.35;
-  double kI = 0.0002;
-  double kD = 0.6;
-
-  double error = 0;
-  double prevError = 0;
-  double integral = 0;
-  double derivative = 0;
-
-  resetEncoders();
+  LeftDrive.setPosition(0, degrees);
+  RightDrive.setPosition(0, degrees);
 
   while (true) {
-    double position = getAverageEncoder();
-    error = targetDeg - position;
 
-    // Anti-windup
-    if (fabs(error) < 50)
-      integral += error;
-    else
-      integral = 0;
+    double avgPosition =
+      (LeftDrive.position(degrees) + RightDrive.position(degrees)) / 2;
 
-    derivative = error - prevError;
+    error = targetDegrees - avgPosition;
+    derivative = error - lastError;
+    integral += error;
 
-    double power = (kP * error) + (kI * integral) + (kD * derivative);
+    double power = kP_drive * error +
+                   kI_drive * integral +
+                   kD_drive * derivative;
 
-    // Slow-down near target
-    double maxPower = 100;
-    if (fabs(error) < 150) maxPower = 40;
-    if (fabs(error) < 60)  maxPower = 25;
+    LeftDrive.spin(forward, power, voltageUnits::volt);
+    RightDrive.spin(forward, power, voltageUnits::volt);
 
-    // Clamp motor power
-    if (power > maxPower) power = maxPower;
-    if (power < -maxPower) power = -maxPower;
+    lastError = error;
 
-    setDrive(power);
-    prevError = error;
-
-    // Stop condition (no overshoot)
-    if (fabs(error) < 5 && fabs(derivative) < 1)
+    if (fabs(error) < 5 ||
+        Brain.timer(msec) - startTime > timeout)
       break;
 
     wait(20, msec);
   }
 
-  // Stop motors with hold to prevent rebound
-  L1.stop(hold);
-  L2.stop(hold);
-  R1.stop(hold);
-  R2.stop(hold);
+  LeftDrive.stop(brake);
+  RightDrive.stop(brake);
 }
 
-// -------------------- Main --------------------
-int main() {
+// =====================
+// Turn PID
+// =====================
+void turnPID(double targetAngle, int timeout = 2000) {
 
-  // Forward
-  drivePID(720);   // 2 wheel rotations
-  wait(1, sec);
+  InertialSensor.setRotation(0, degrees);
 
-  // Backward
-  drivePID(-720);
+  double error, lastError = 0, derivative, integral = 0;
+  double startTime = Brain.timer(msec);
 
   while (true) {
-    wait(100, msec);
+
+    double currentAngle = InertialSensor.rotation();
+    error = targetAngle - currentAngle;
+
+    derivative = error - lastError;
+    integral += error;
+
+    double power = kP_turn * error +
+                   kI_turn * integral +
+                   kD_turn * derivative;
+
+    LeftDrive.spin(forward, power, volt);
+    RightDrive.spin(reverse, power, volt);
+
+    lastError = error;
+
+    if (fabs(error) < 2 ||
+        Brain.timer(msec) - startTime > timeout)
+      break;
+
+    wait(20, msec);
   }
+
+  LeftDrive.stop(brake);
+  RightDrive.stop(brake);
+}
+
+// =====================
+// Pre-auton
+// =====================
+void pre_auton(void) {
+  vexcodeInit();
+  InertialSensor.calibrate();
+  while (InertialSensor.isCalibrating())
+    wait(20, msec);
+}
+
+// =====================
+// Autonomous
+// =====================
+void autonomous(void) {
+  drivePID(24);
+  wait(300, msec);
+  turnPID(90);
+}
+
+// =====================
+// User Control
+// =====================
+void usercontrol(void) {
+
+  while (true) {
+
+    // Arcade Drive
+    int forward = Controller1.Axis3.position();
+    int turn    = Controller1.Axis1.position();
+
+    LeftDrive.spin(fwd, forward + turn, pct);
+    RightDrive.spin(fwd, forward - turn, pct);
+
+    // Optical light
+    opti.setLight(ledState::on);
+    opti.setLightPower(100, pct);
+
+    // Intake Control
+    if (Controller1.ButtonL1.pressing()) {
+
+      Motor11.spin(fwd,100,pct);
+      Motor12.spin(fwd,100,pct);
+      Motor13.spin(fwd,100,pct);
+      Motor14.spin(fwd,100,pct);
+      Motor15.spin(fwd,100,pct);
+
+    }
+    else if (Controller1.ButtonL2.pressing()) {
+
+      Motor11.spin(reverse,100,pct);
+      Motor12.spin(reverse,100,pct);
+      Motor13.spin(reverse,100,pct);
+      Motor14.spin(reverse,100,pct);
+      Motor15.spin(reverse,100,pct);
+
+    }
+    else {
+
+      Motor11.stop(coast);
+      Motor12.stop(coast);
+      Motor13.stop(coast);
+      Motor14.stop(coast);
+      Motor15.stop(coast);
+    }
+
+    // Pneumatic
+    DigitalOutA.set(Controller1.ButtonA.pressing());
+
+    wait(20, msec);
+  }
+}
+
+// =====================
+// Main
+// =====================
+int main() {
+
+  Competition.autonomous(autonomous);
+  Competition.drivercontrol(usercontrol);
+
+  pre_auton();
+
+  while (true)
+    wait(100, msec);
 }
